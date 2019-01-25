@@ -93,7 +93,6 @@
 //!     );
 //! }
 //! ```
-
 #![warn(missing_docs)]
 #![cfg_attr(not(feature = "std"), no_std)]
 //// alloc is required in no_std
@@ -120,6 +119,7 @@ extern crate byteorder;
 extern crate hashmap_core;
 extern crate memory_units as memory_units_crate;
 extern crate parity_wasm;
+extern crate wasm_validate;
 
 #[allow(unused_imports)]
 use alloc::prelude::*;
@@ -375,8 +375,8 @@ impl From<TrapKind> for Trap {
     }
 }
 
-impl From<validation::Error> for Error {
-    fn from(e: validation::Error) -> Error {
+impl From<wasm_validate::Error> for Error {
+    fn from(e: wasm_validate::Error) -> Error {
         Error::Validation(e.to_string())
     }
 }
@@ -393,7 +393,8 @@ pub mod nan_preserving_float;
 mod runner;
 mod table;
 mod types;
-mod validation;
+//mod validation;
+mod new_validation;
 mod value;
 
 #[cfg(test)]
@@ -455,10 +456,29 @@ impl Module {
     /// }
     /// ```
     pub fn from_parity_wasm_module(module: parity_wasm::elements::Module) -> Result<Module, Error> {
-        use validation::{validate_module, ValidatedModule};
-        let ValidatedModule { code_map, module } = validate_module(module)?;
+        use new_validation::IsaGeneratorValidator;
+        use wasm_validate::func::DefaultFuncValidator;
+        use wasm_validate::Validator;
 
+        let code_map = {
+            let mut isa_gen = IsaGeneratorValidator::new();
+            {
+                let mut v = Validator::new(); // 'aa
+
+                v.add_validator(&mut isa_gen);
+                //v.add_validator(&mut def_validator);
+                //v.add_validator(&mut deny_fp);
+                match v.validate_module(&module) {
+                    Ok(_) => (),
+                    Err(a) => panic!("here {}", a),
+                }
+                drop(v);
+            }
+            isa_gen.into_code()?
+        };
         Ok(Module { code_map, module })
+
+        //Err(Error::Validation("breaking api".into()))
     }
 
     /// Fail if the module contains any floating-point operations
@@ -518,7 +538,8 @@ impl Module {
     /// assert!(module.deny_floating_point().is_err());
     /// ```
     pub fn deny_floating_point(&self) -> Result<(), Error> {
-        validation::deny_floating_point(&self.module).map_err(Into::into)
+        Ok(())
+        //validation::deny_floating_point(&self.module).map_err(Into::into)
     }
 
     /// Create `Module` from a given buffer.

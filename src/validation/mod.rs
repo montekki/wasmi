@@ -1,456 +1,1391 @@
-#[allow(unused_imports)]
-use alloc::prelude::*;
-use core::fmt;
-#[cfg(feature = "std")]
-use std::error;
-
-#[cfg(not(feature = "std"))]
-use hashmap_core::HashSet;
-#[cfg(feature = "std")]
-use std::collections::HashSet;
-
-use self::context::ModuleContextBuilder;
-use self::func::FunctionReader;
-use common::stack;
+#![allow(dead_code)]
 use isa;
-use memory_units::Pages;
-use parity_wasm::elements::{
-    BlockType, External, GlobalEntry, GlobalType, InitExpr, Instruction, Internal, MemoryType,
-    Module, ResizableLimits, TableType, Type, ValueType,
-};
+use parity_wasm::elements::{BlockType, Func, FuncBody, Instruction, ValueType};
 
-mod context;
-mod func;
+use new_validation::util::Locals;
+use wasm_validate::common::stack::StackWithLimit;
+use wasm_validate::context::ModuleContext;
+use wasm_validate::{Error, FunctionValidator, Outcome};
+
 mod util;
 
-#[cfg(test)]
-mod tests;
+/// Maximum number of entries in value stack per function.
+const DEFAULT_VALUE_STACK_LIMIT: usize = 16384;
+/// Maximum number of entries in frame stack per function.
+const DEFAULT_FRAME_STACK_LIMIT: usize = 16384;
 
-#[derive(Debug)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+/// Control stack frame.
+#[derive(Debug, Clone)]
+struct BlockFrame {
+    /// Frame type.
+    frame_type: BlockFrameType,
+    /// A signature, which is a block signature type indicating the number and types of result values of the region.
+    block_type: BlockType,
+    /// A label for reference to block instruction.
+    begin_position: usize,
+    /// A limit integer value, which is an index into the value stack indicating where to reset it to on a branch to that label.
+    value_stack_len: usize,
+    /// Boolean which signals whether value stack became polymorphic. Value stack starts in non-polymorphic state and
+    /// becomes polymorphic only after an instruction that never passes control further is executed,
+    /// i.e. `unreachable`, `br` (but not `br_if`!), etc.
+    polymorphic_stack: bool,
 }
 
-#[cfg(feature = "std")]
-impl error::Error for Error {
-    fn description(&self) -> &str {
-        &self.0
-    }
+/// Type of block frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BlockFrameType {
+    /// Usual block frame.
+    ///
+    /// Can be used for an implicit function block.
+    Block { end_label: LabelId },
+    /// Loop frame (branching to the beginning of block).
+    Loop { header: LabelId },
+    /// True-subblock of if expression.
+    IfTrue {
+        /// If jump happens inside the if-true block then control will
+        /// land on this label.
+        end_label: LabelId,
+
+        /// If the condition of the `if` statement is unsatisfied, control
+        /// will land on this label. This label might point to `else` block if it
+        /// exists. Otherwise it equal to `end_label`.
+        if_not: LabelId,
+    },
+    /// False-subblock of if expression.
+    IfFalse { end_label: LabelId },
 }
 
-impl From<stack::Error> for Error {
-    fn from(e: stack::Error) -> Error {
-        Error(format!("Stack: {}", e))
-    }
-}
-
-#[derive(Clone)]
-pub struct ValidatedModule {
-    pub code_map: Vec<isa::Instructions>,
-    pub module: Module,
-}
-
-impl ::core::ops::Deref for ValidatedModule {
-    type Target = Module;
-    fn deref(&self) -> &Module {
-        &self.module
-    }
-}
-
-pub fn deny_floating_point(module: &Module) -> Result<(), Error> {
-    if let Some(code) = module.code_section() {
-        for op in code.bodies().iter().flat_map(|body| body.code().elements()) {
-            use parity_wasm::elements::Instruction::*;
-
-            macro_rules! match_eq {
-                ($pattern:pat) => {
-                    |val| if let $pattern = *val { true } else { false }
-                };
-            }
-
-            const DENIED: &[fn(&Instruction) -> bool] = &[
-                match_eq!(F32Load(_, _)),
-                match_eq!(F64Load(_, _)),
-                match_eq!(F32Store(_, _)),
-                match_eq!(F64Store(_, _)),
-                match_eq!(F32Const(_)),
-                match_eq!(F64Const(_)),
-                match_eq!(F32Eq),
-                match_eq!(F32Ne),
-                match_eq!(F32Lt),
-                match_eq!(F32Gt),
-                match_eq!(F32Le),
-                match_eq!(F32Ge),
-                match_eq!(F64Eq),
-                match_eq!(F64Ne),
-                match_eq!(F64Lt),
-                match_eq!(F64Gt),
-                match_eq!(F64Le),
-                match_eq!(F64Ge),
-                match_eq!(F32Abs),
-                match_eq!(F32Neg),
-                match_eq!(F32Ceil),
-                match_eq!(F32Floor),
-                match_eq!(F32Trunc),
-                match_eq!(F32Nearest),
-                match_eq!(F32Sqrt),
-                match_eq!(F32Add),
-                match_eq!(F32Sub),
-                match_eq!(F32Mul),
-                match_eq!(F32Div),
-                match_eq!(F32Min),
-                match_eq!(F32Max),
-                match_eq!(F32Copysign),
-                match_eq!(F64Abs),
-                match_eq!(F64Neg),
-                match_eq!(F64Ceil),
-                match_eq!(F64Floor),
-                match_eq!(F64Trunc),
-                match_eq!(F64Nearest),
-                match_eq!(F64Sqrt),
-                match_eq!(F64Add),
-                match_eq!(F64Sub),
-                match_eq!(F64Mul),
-                match_eq!(F64Div),
-                match_eq!(F64Min),
-                match_eq!(F64Max),
-                match_eq!(F64Copysign),
-                match_eq!(F32ConvertSI32),
-                match_eq!(F32ConvertUI32),
-                match_eq!(F32ConvertSI64),
-                match_eq!(F32ConvertUI64),
-                match_eq!(F32DemoteF64),
-                match_eq!(F64ConvertSI32),
-                match_eq!(F64ConvertUI32),
-                match_eq!(F64ConvertSI64),
-                match_eq!(F64ConvertUI64),
-                match_eq!(F64PromoteF32),
-                match_eq!(F32ReinterpretI32),
-                match_eq!(F64ReinterpretI64),
-                match_eq!(I32TruncSF32),
-                match_eq!(I32TruncUF32),
-                match_eq!(I32TruncSF64),
-                match_eq!(I32TruncUF64),
-                match_eq!(I64TruncSF32),
-                match_eq!(I64TruncUF32),
-                match_eq!(I64TruncSF64),
-                match_eq!(I64TruncUF64),
-                match_eq!(I32ReinterpretF32),
-                match_eq!(I64ReinterpretF64),
-            ];
-
-            if DENIED.iter().any(|is_denied| is_denied(op)) {
-                return Err(Error(format!("Floating point operation denied: {:?}", op)));
-            }
+impl BlockFrameType {
+    /// Returns a label which should be used as a branch destination.
+    fn br_destination(&self) -> LabelId {
+        match *self {
+            BlockFrameType::Block { end_label } => end_label,
+            BlockFrameType::Loop { header } => header,
+            BlockFrameType::IfTrue { end_label, .. } => end_label,
+            BlockFrameType::IfFalse { end_label } => end_label,
         }
     }
 
-    if let (Some(sec), Some(types)) = (module.function_section(), module.type_section()) {
-        use parity_wasm::elements::{Type, ValueType};
+    /// Returns a label which should be resolved at the `End` opcode.
+    ///
+    /// All block types have it except loops. Loops doesn't use end as a branch
+    /// destination.
+    fn end_label(&self) -> LabelId {
+        match *self {
+            BlockFrameType::Block { end_label } => end_label,
+            BlockFrameType::IfTrue { end_label, .. } => end_label,
+            BlockFrameType::IfFalse { end_label } => end_label,
+            BlockFrameType::Loop { .. } => panic!("loop doesn't use end label"),
+        }
+    }
 
-        let types = types.types();
+    fn is_loop(&self) -> bool {
+        match *self {
+            BlockFrameType::Loop { .. } => true,
+            _ => false,
+        }
+    }
+}
 
-        for sig in sec.entries() {
-            if let Some(typ) = types.get(sig.type_ref() as usize) {
-                match *typ {
-                    Type::Function(ref func) => {
-                        if func
-                            .params()
-                            .iter()
-                            .chain(func.return_type().as_ref())
-                            .any(|&typ| typ == ValueType::F32 || typ == ValueType::F64)
-                        {
-                            return Err(Error(format!("Use of floating point types denied")));
-                        }
+/// Value type on the stack.
+#[derive(Debug, Clone, Copy)]
+enum StackValueType {
+    /// Any value type.
+    Any,
+    /// Concrete value type.
+    Specific(ValueType),
+}
+
+impl StackValueType {
+    fn is_any(&self) -> bool {
+        match self {
+            &StackValueType::Any => true,
+            _ => false,
+        }
+    }
+
+    fn value_type(&self) -> ValueType {
+        match self {
+            &StackValueType::Any => unreachable!("must be checked by caller"),
+            &StackValueType::Specific(value_type) => value_type,
+        }
+    }
+}
+
+impl From<ValueType> for StackValueType {
+    fn from(value_type: ValueType) -> Self {
+        StackValueType::Specific(value_type)
+    }
+}
+
+impl PartialEq<StackValueType> for StackValueType {
+    fn eq(&self, other: &StackValueType) -> bool {
+        if self.is_any() || other.is_any() {
+            true
+        } else {
+            self.value_type() == other.value_type()
+        }
+    }
+}
+
+impl PartialEq<ValueType> for StackValueType {
+    fn eq(&self, other: &ValueType) -> bool {
+        if self.is_any() {
+            true
+        } else {
+            self.value_type() == *other
+        }
+    }
+}
+
+impl PartialEq<StackValueType> for ValueType {
+    fn eq(&self, other: &StackValueType) -> bool {
+        other == self
+    }
+}
+
+struct FunctionContext<'a> {
+    /// Local variables.
+    locals: Locals<'a>,
+    /// Value stack.
+    value_stack: StackWithLimit<StackValueType>,
+    /// Frame stack.
+    frame_stack: StackWithLimit<BlockFrame>,
+    /// Function return type
+    return_type: BlockType,
+    /// A sink used to emit optimized code.
+    sink: Sink,
+}
+
+impl<'a> FunctionContext<'a> {
+    fn new(
+        locals: Locals<'a>,
+        value_stack_limit: usize,
+        frame_stack_limit: usize,
+        return_type: BlockType,
+        size_estimate: usize,
+    ) -> Self {
+        FunctionContext {
+            locals,
+            value_stack: StackWithLimit::with_limit(value_stack_limit),
+            frame_stack: StackWithLimit::with_limit(frame_stack_limit),
+            return_type,
+            sink: Sink::with_instruction_capacity(size_estimate),
+        }
+    }
+}
+
+pub(crate) struct IsaGeneratorValidator<'a> {
+    context: Option<FunctionContext<'a>>,
+    code: Vec<isa::Instructions>,
+}
+
+impl<'a> FunctionValidator<'a> for IsaGeneratorValidator<'a> {
+    fn begin_function(
+        &mut self,
+        module: &ModuleContext,
+        func: &'a Func,
+        body: &'a FuncBody,
+    ) -> Result<(), Error> {
+        let (params, result_ty) = module.require_function_type(func.type_ref())?;
+        let ins_size_estimate = body.code().elements().len();
+        let mut context = FunctionContext::new(
+            Locals::new(params.to_vec(), body.locals())?,
+            DEFAULT_VALUE_STACK_LIMIT,
+            DEFAULT_FRAME_STACK_LIMIT,
+            result_ty,
+            ins_size_estimate,
+        );
+        let end_label = context.sink.new_label();
+        push_label(
+            BlockFrameType::Block { end_label },
+            result_ty,
+            0,
+            &context.value_stack,
+            &mut context.frame_stack,
+        )?;
+        self.context = Some(context);
+        Ok(())
+    }
+    fn next_instruction(
+        &mut self,
+        module: &ModuleContext,
+        instruction: &Instruction,
+        position: usize,
+    ) -> Result<(), Error> {
+        self.next(module, instruction, position)?;
+        Ok(())
+    }
+
+    fn end_function(&mut self) {
+        match self.context.take() {
+            Some(context) => self.code.push(context.sink.into_inner()),
+            None => (),
+        }
+    }
+}
+
+impl<'a> IsaGeneratorValidator<'a> {
+    pub fn new() -> Self {
+        IsaGeneratorValidator {
+            context: None,
+            code: vec![],
+        }
+    }
+
+    fn get_context(&mut self) -> Result<&mut FunctionContext<'a>, Error> {
+        match self.context {
+            Some(ref mut ctx) => return Ok(ctx),
+            None => return Err(Error("".into())),
+        }
+    }
+
+    fn next(
+        &mut self,
+        module: &ModuleContext,
+        instruction: &Instruction,
+        position: usize,
+    ) -> Result<Outcome, Error> {
+        use self::Instruction::*;
+
+        let context = self.get_context()?;
+        dbg!(instruction);
+        dbg!(position);
+
+        match *instruction {
+            // Nop instruction doesn't do anything. It is safe to just skip it.
+            Nop => {}
+
+            Unreachable => {
+                context.sink.emit(isa::InstructionInternal::Unreachable);
+                return Ok(Outcome::Unreachable);
+            }
+
+            Block(block_type) => {
+                let end_label = context.sink.new_label();
+                push_label(
+                    BlockFrameType::Block { end_label },
+                    block_type,
+                    position,
+                    &context.value_stack,
+                    &mut context.frame_stack,
+                )?;
+            }
+            Loop(block_type) => {
+                // Resolve loop header right away.
+                let header = context.sink.new_label();
+                context.sink.resolve_label(header);
+
+                push_label(
+                    BlockFrameType::Loop { header },
+                    block_type,
+                    position,
+                    &context.value_stack,
+                    &mut context.frame_stack,
+                )?;
+            }
+            If(block_type) => {
+                // `if_not` will be resolved whenever `End` or `Else` operator will be met.
+                // `end_label` will always be resolved at `End`.
+                let if_not = context.sink.new_label();
+                let end_label = context.sink.new_label();
+
+                pop_value(
+                    &mut context.value_stack,
+                    &context.frame_stack,
+                    ValueType::I32.into(),
+                )?;
+                push_label(
+                    BlockFrameType::IfTrue { if_not, end_label },
+                    block_type,
+                    position,
+                    &context.value_stack,
+                    &mut context.frame_stack,
+                )?;
+
+                context.sink.emit_br_eqz(Target {
+                    label: if_not,
+                    drop_keep: isa::DropKeep {
+                        drop: 0,
+                        keep: isa::Keep::None,
+                    },
+                });
+            }
+            Else => {
+                let (block_type, if_not, end_label) = {
+                    let top_frame = top_label(&context.frame_stack);
+
+                    let (if_not, end_label) = match top_frame.frame_type {
+                        BlockFrameType::IfTrue { if_not, end_label } => (if_not, end_label),
+                        _ => return Err(Error("Misplaced else instruction".into())),
+                    };
+                    (top_frame.block_type, if_not, end_label)
+                };
+
+                // First, we need to finish if-true block: add a jump from the end of the if-true block
+                // to the "end_label" (it will be resolved at End).
+                context.sink.emit_br(Target {
+                    label: end_label,
+                    drop_keep: isa::DropKeep {
+                        drop: 0,
+                        keep: isa::Keep::None,
+                    },
+                });
+
+                // Resolve `if_not` to here so when if condition is unsatisfied control flow
+                // will jump to this label.
+                context.sink.resolve_label(if_not);
+
+                // Then, we pop the current label. It discards all values that pushed in the current
+                // frame.
+                pop_label(&mut context.value_stack, &mut context.frame_stack)?;
+                push_label(
+                    BlockFrameType::IfFalse { end_label },
+                    block_type,
+                    position,
+                    &context.value_stack,
+                    &mut context.frame_stack,
+                )?;
+            }
+            End => {
+                let (frame_type, block_type) = {
+                    let top = top_label(&context.frame_stack);
+                    (top.frame_type, top.block_type)
+                };
+
+                if let BlockFrameType::IfTrue { if_not, .. } = frame_type {
+                    // A `if` without an `else` can't return a result.
+                    if block_type != BlockType::NoResult {
+                        return Err(Error(format!(
+									"If block without else required to have NoResult block type. But it has {:?} type",
+									block_type
+								)));
                     }
+
+                    // Resolve `if_not` label. If the `if's` condition doesn't hold the control will jump
+                    // to here.
+                    context.sink.resolve_label(if_not);
+                }
+
+                // Unless it's a loop, resolve the `end_label` position here.
+                if !frame_type.is_loop() {
+                    let end_label = frame_type.end_label();
+                    context.sink.resolve_label(end_label);
+                }
+
+                if context.frame_stack.len() == 1 {
+                    // We are about to close the last frame. Insert
+                    // an explicit return.
+
+                    // Check the return type.
+                    if let BlockType::Value(value_type) = context.return_type {
+                        tee_value(
+                            &mut context.value_stack,
+                            &context.frame_stack,
+                            value_type.into(),
+                        )?;
+                    }
+
+                    // Emit the return instruction.
+                    let drop_keep = drop_keep_return(
+                        &context.locals,
+                        &context.value_stack,
+                        &context.frame_stack,
+                    );
+                    context
+                        .sink
+                        .emit(isa::InstructionInternal::Return(drop_keep));
+                }
+
+                pop_label(&mut context.value_stack, &mut context.frame_stack)?;
+
+                // Push the result value.
+                if let BlockType::Value(value_type) = block_type {
+                    push_value(&mut context.value_stack, value_type.into())?;
                 }
             }
+            Br(depth) => {
+                let target = require_target(depth, &context.value_stack, &context.frame_stack);
+                context.sink.emit_br(target);
+
+                return Ok(Outcome::Unreachable);
+            }
+            BrIf(depth) => {
+                let target = require_target(depth, &context.value_stack, &context.frame_stack);
+                context.sink.emit_br_nez(target);
+            }
+            BrTable(ref table, default) => {
+                let mut targets = Vec::new();
+                for depth in table.iter() {
+                    let target = require_target(*depth, &context.value_stack, &context.frame_stack);
+                    targets.push(target);
+                }
+                let default_target =
+                    require_target(default, &context.value_stack, &context.frame_stack);
+                context.sink.emit_br_table(&targets, default_target);
+
+                return Ok(Outcome::Unreachable);
+            }
+            Return => {
+                if let BlockType::Value(value_type) = context.return_type {
+                    tee_value(
+                        &mut context.value_stack,
+                        &context.frame_stack,
+                        value_type.into(),
+                    )?;
+                }
+
+                let drop_keep =
+                    drop_keep_return(&context.locals, &context.value_stack, &context.frame_stack);
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::Return(drop_keep));
+
+                return Ok(Outcome::Unreachable);
+            }
+
+            Call(index) => {
+                let (a, r) = module.require_function(index)?;
+
+                for ar_type in a.iter().rev() {
+                    pop_value(
+                        &mut context.value_stack,
+                        &context.frame_stack,
+                        (*ar_type).into(),
+                    )?;
+                }
+                if let BlockType::Value(value_type) = r {
+                    push_value(&mut context.value_stack, value_type.into())?;
+                }
+
+                context.sink.emit(isa::InstructionInternal::Call(index));
+            }
+            CallIndirect(index, _reserved) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::CallIndirect(index));
+            }
+
+            Drop => {
+                context.sink.emit(isa::InstructionInternal::Drop);
+            }
+            Select => {
+                context.sink.emit(isa::InstructionInternal::Select);
+            }
+
+            GetLocal(index) => {
+                // We need to calculate relative depth before validation since
+                // it will change the value stack size.
+                let depth = relative_local_depth(index, &context.locals, &context.value_stack)?;
+                context.sink.emit(isa::InstructionInternal::GetLocal(depth));
+            }
+            SetLocal(index) => {
+                let depth = relative_local_depth(index, &context.locals, &context.value_stack)?;
+                context.sink.emit(isa::InstructionInternal::SetLocal(depth));
+            }
+            TeeLocal(index) => {
+                let depth = relative_local_depth(index, &context.locals, &context.value_stack)?;
+                context.sink.emit(isa::InstructionInternal::TeeLocal(depth));
+            }
+            GetGlobal(index) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::GetGlobal(index));
+            }
+            SetGlobal(index) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::SetGlobal(index));
+            }
+
+            I32Load(_, offset) => {
+                context.sink.emit(isa::InstructionInternal::I32Load(offset));
+            }
+            I64Load(_, offset) => {
+                context.sink.emit(isa::InstructionInternal::I64Load(offset));
+            }
+            F32Load(_, offset) => {
+                context.sink.emit(isa::InstructionInternal::F32Load(offset));
+            }
+            F64Load(_, offset) => {
+                context.sink.emit(isa::InstructionInternal::F64Load(offset));
+            }
+            I32Load8S(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Load8S(offset));
+            }
+            I32Load8U(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Load8U(offset));
+            }
+            I32Load16S(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Load16S(offset));
+            }
+            I32Load16U(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Load16U(offset));
+            }
+            I64Load8S(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Load8S(offset));
+            }
+            I64Load8U(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Load8U(offset));
+            }
+            I64Load16S(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Load16S(offset));
+            }
+            I64Load16U(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Load16U(offset));
+            }
+            I64Load32S(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Load32S(offset));
+            }
+            I64Load32U(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Load32U(offset));
+            }
+
+            I32Store(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Store(offset));
+            }
+            I64Store(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Store(offset));
+            }
+            F32Store(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::F32Store(offset));
+            }
+            F64Store(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::F64Store(offset));
+            }
+            I32Store8(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Store8(offset));
+            }
+            I32Store16(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32Store16(offset));
+            }
+            I64Store8(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Store8(offset));
+            }
+            I64Store16(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Store16(offset));
+            }
+            I64Store32(_, offset) => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64Store32(offset));
+            }
+
+            CurrentMemory(_) => {
+                context.sink.emit(isa::InstructionInternal::CurrentMemory);
+            }
+            GrowMemory(_) => {
+                context.sink.emit(isa::InstructionInternal::GrowMemory);
+            }
+
+            I32Const(v) => {
+                push_value(&mut context.value_stack, (ValueType::I32).into())?;
+                context.sink.emit(isa::InstructionInternal::I32Const(v));
+            }
+            I64Const(v) => {
+                context.sink.emit(isa::InstructionInternal::I64Const(v));
+            }
+            F32Const(v) => {
+                context.sink.emit(isa::InstructionInternal::F32Const(v));
+            }
+            F64Const(v) => {
+                context.sink.emit(isa::InstructionInternal::F64Const(v));
+            }
+
+            I32Eqz => {
+                context.sink.emit(isa::InstructionInternal::I32Eqz);
+            }
+            I32Eq => {
+                context.sink.emit(isa::InstructionInternal::I32Eq);
+            }
+            I32Ne => {
+                context.sink.emit(isa::InstructionInternal::I32Ne);
+            }
+            I32LtS => {
+                context.sink.emit(isa::InstructionInternal::I32LtS);
+            }
+            I32LtU => {
+                context.sink.emit(isa::InstructionInternal::I32LtU);
+            }
+            I32GtS => {
+                context.sink.emit(isa::InstructionInternal::I32GtS);
+            }
+            I32GtU => {
+                context.sink.emit(isa::InstructionInternal::I32GtU);
+            }
+            I32LeS => {
+                context.sink.emit(isa::InstructionInternal::I32LeS);
+            }
+            I32LeU => {
+                context.sink.emit(isa::InstructionInternal::I32LeU);
+            }
+            I32GeS => {
+                context.sink.emit(isa::InstructionInternal::I32GeS);
+            }
+            I32GeU => {
+                context.sink.emit(isa::InstructionInternal::I32GeU);
+            }
+
+            I64Eqz => {
+                context.sink.emit(isa::InstructionInternal::I64Eqz);
+            }
+            I64Eq => {
+                context.sink.emit(isa::InstructionInternal::I64Eq);
+            }
+            I64Ne => {
+                context.sink.emit(isa::InstructionInternal::I64Ne);
+            }
+            I64LtS => {
+                context.sink.emit(isa::InstructionInternal::I64LtS);
+            }
+            I64LtU => {
+                context.sink.emit(isa::InstructionInternal::I64LtU);
+            }
+            I64GtS => {
+                context.sink.emit(isa::InstructionInternal::I64GtS);
+            }
+            I64GtU => {
+                context.sink.emit(isa::InstructionInternal::I64GtU);
+            }
+            I64LeS => {
+                context.sink.emit(isa::InstructionInternal::I64LeS);
+            }
+            I64LeU => {
+                context.sink.emit(isa::InstructionInternal::I64LeU);
+            }
+            I64GeS => {
+                context.sink.emit(isa::InstructionInternal::I64GeS);
+            }
+            I64GeU => {
+                context.sink.emit(isa::InstructionInternal::I64GeU);
+            }
+
+            F32Eq => {
+                context.sink.emit(isa::InstructionInternal::F32Eq);
+            }
+            F32Ne => {
+                context.sink.emit(isa::InstructionInternal::F32Ne);
+            }
+            F32Lt => {
+                context.sink.emit(isa::InstructionInternal::F32Lt);
+            }
+            F32Gt => {
+                context.sink.emit(isa::InstructionInternal::F32Gt);
+            }
+            F32Le => {
+                context.sink.emit(isa::InstructionInternal::F32Le);
+            }
+            F32Ge => {
+                context.sink.emit(isa::InstructionInternal::F32Ge);
+            }
+
+            F64Eq => {
+                context.sink.emit(isa::InstructionInternal::F64Eq);
+            }
+            F64Ne => {
+                context.sink.emit(isa::InstructionInternal::F64Ne);
+            }
+            F64Lt => {
+                context.sink.emit(isa::InstructionInternal::F64Lt);
+            }
+            F64Gt => {
+                context.sink.emit(isa::InstructionInternal::F64Gt);
+            }
+            F64Le => {
+                context.sink.emit(isa::InstructionInternal::F64Le);
+            }
+            F64Ge => {
+                context.sink.emit(isa::InstructionInternal::F64Ge);
+            }
+
+            I32Clz => {
+                context.sink.emit(isa::InstructionInternal::I32Clz);
+            }
+            I32Ctz => {
+                context.sink.emit(isa::InstructionInternal::I32Ctz);
+            }
+            I32Popcnt => {
+                context.sink.emit(isa::InstructionInternal::I32Popcnt);
+            }
+            I32Add => {
+                context.sink.emit(isa::InstructionInternal::I32Add);
+            }
+            I32Sub => {
+                context.sink.emit(isa::InstructionInternal::I32Sub);
+            }
+            I32Mul => {
+                context.sink.emit(isa::InstructionInternal::I32Mul);
+            }
+            I32DivS => {
+                context.sink.emit(isa::InstructionInternal::I32DivS);
+            }
+            I32DivU => {
+                context.sink.emit(isa::InstructionInternal::I32DivU);
+            }
+            I32RemS => {
+                context.sink.emit(isa::InstructionInternal::I32RemS);
+            }
+            I32RemU => {
+                context.sink.emit(isa::InstructionInternal::I32RemU);
+            }
+            I32And => {
+                context.sink.emit(isa::InstructionInternal::I32And);
+            }
+            I32Or => {
+                context.sink.emit(isa::InstructionInternal::I32Or);
+            }
+            I32Xor => {
+                context.sink.emit(isa::InstructionInternal::I32Xor);
+            }
+            I32Shl => {
+                context.sink.emit(isa::InstructionInternal::I32Shl);
+            }
+            I32ShrS => {
+                context.sink.emit(isa::InstructionInternal::I32ShrS);
+            }
+            I32ShrU => {
+                context.sink.emit(isa::InstructionInternal::I32ShrU);
+            }
+            I32Rotl => {
+                context.sink.emit(isa::InstructionInternal::I32Rotl);
+            }
+            I32Rotr => {
+                context.sink.emit(isa::InstructionInternal::I32Rotr);
+            }
+
+            I64Clz => {
+                context.sink.emit(isa::InstructionInternal::I64Clz);
+            }
+            I64Ctz => {
+                context.sink.emit(isa::InstructionInternal::I64Ctz);
+            }
+            I64Popcnt => {
+                context.sink.emit(isa::InstructionInternal::I64Popcnt);
+            }
+            I64Add => {
+                context.sink.emit(isa::InstructionInternal::I64Add);
+            }
+            I64Sub => {
+                context.sink.emit(isa::InstructionInternal::I64Sub);
+            }
+            I64Mul => {
+                context.sink.emit(isa::InstructionInternal::I64Mul);
+            }
+            I64DivS => {
+                context.sink.emit(isa::InstructionInternal::I64DivS);
+            }
+            I64DivU => {
+                context.sink.emit(isa::InstructionInternal::I64DivU);
+            }
+            I64RemS => {
+                context.sink.emit(isa::InstructionInternal::I64RemS);
+            }
+            I64RemU => {
+                context.sink.emit(isa::InstructionInternal::I64RemU);
+            }
+            I64And => {
+                context.sink.emit(isa::InstructionInternal::I64And);
+            }
+            I64Or => {
+                context.sink.emit(isa::InstructionInternal::I64Or);
+            }
+            I64Xor => {
+                context.sink.emit(isa::InstructionInternal::I64Xor);
+            }
+            I64Shl => {
+                context.sink.emit(isa::InstructionInternal::I64Shl);
+            }
+            I64ShrS => {
+                context.sink.emit(isa::InstructionInternal::I64ShrS);
+            }
+            I64ShrU => {
+                context.sink.emit(isa::InstructionInternal::I64ShrU);
+            }
+            I64Rotl => {
+                context.sink.emit(isa::InstructionInternal::I64Rotl);
+            }
+            I64Rotr => {
+                context.sink.emit(isa::InstructionInternal::I64Rotr);
+            }
+
+            F32Abs => {
+                context.sink.emit(isa::InstructionInternal::F32Abs);
+            }
+            F32Neg => {
+                context.sink.emit(isa::InstructionInternal::F32Neg);
+            }
+            F32Ceil => {
+                context.sink.emit(isa::InstructionInternal::F32Ceil);
+            }
+            F32Floor => {
+                context.sink.emit(isa::InstructionInternal::F32Floor);
+            }
+            F32Trunc => {
+                context.sink.emit(isa::InstructionInternal::F32Trunc);
+            }
+            F32Nearest => {
+                context.sink.emit(isa::InstructionInternal::F32Nearest);
+            }
+            F32Sqrt => {
+                context.sink.emit(isa::InstructionInternal::F32Sqrt);
+            }
+            F32Add => {
+                context.sink.emit(isa::InstructionInternal::F32Add);
+            }
+            F32Sub => {
+                context.sink.emit(isa::InstructionInternal::F32Sub);
+            }
+            F32Mul => {
+                context.sink.emit(isa::InstructionInternal::F32Mul);
+            }
+            F32Div => {
+                context.sink.emit(isa::InstructionInternal::F32Div);
+            }
+            F32Min => {
+                context.sink.emit(isa::InstructionInternal::F32Min);
+            }
+            F32Max => {
+                context.sink.emit(isa::InstructionInternal::F32Max);
+            }
+            F32Copysign => {
+                context.sink.emit(isa::InstructionInternal::F32Copysign);
+            }
+
+            F64Abs => {
+                context.sink.emit(isa::InstructionInternal::F64Abs);
+            }
+            F64Neg => {
+                context.sink.emit(isa::InstructionInternal::F64Neg);
+            }
+            F64Ceil => {
+                context.sink.emit(isa::InstructionInternal::F64Ceil);
+            }
+            F64Floor => {
+                context.sink.emit(isa::InstructionInternal::F64Floor);
+            }
+            F64Trunc => {
+                context.sink.emit(isa::InstructionInternal::F64Trunc);
+            }
+            F64Nearest => {
+                context.sink.emit(isa::InstructionInternal::F64Nearest);
+            }
+            F64Sqrt => {
+                context.sink.emit(isa::InstructionInternal::F64Sqrt);
+            }
+            F64Add => {
+                context.sink.emit(isa::InstructionInternal::F64Add);
+            }
+            F64Sub => {
+                context.sink.emit(isa::InstructionInternal::F64Sub);
+            }
+            F64Mul => {
+                context.sink.emit(isa::InstructionInternal::F64Mul);
+            }
+            F64Div => {
+                context.sink.emit(isa::InstructionInternal::F64Div);
+            }
+            F64Min => {
+                context.sink.emit(isa::InstructionInternal::F64Min);
+            }
+            F64Max => {
+                context.sink.emit(isa::InstructionInternal::F64Max);
+            }
+            F64Copysign => {
+                context.sink.emit(isa::InstructionInternal::F64Copysign);
+            }
+
+            I32WrapI64 => {
+                context.sink.emit(isa::InstructionInternal::I32WrapI64);
+            }
+            I32TruncSF32 => {
+                context.sink.emit(isa::InstructionInternal::I32TruncSF32);
+            }
+            I32TruncUF32 => {
+                context.sink.emit(isa::InstructionInternal::I32TruncUF32);
+            }
+            I32TruncSF64 => {
+                context.sink.emit(isa::InstructionInternal::I32TruncSF64);
+            }
+            I32TruncUF64 => {
+                context.sink.emit(isa::InstructionInternal::I32TruncUF64);
+            }
+            I64ExtendSI32 => {
+                context.sink.emit(isa::InstructionInternal::I64ExtendSI32);
+            }
+            I64ExtendUI32 => {
+                context.sink.emit(isa::InstructionInternal::I64ExtendUI32);
+            }
+            I64TruncSF32 => {
+                context.sink.emit(isa::InstructionInternal::I64TruncSF32);
+            }
+            I64TruncUF32 => {
+                context.sink.emit(isa::InstructionInternal::I64TruncUF32);
+            }
+            I64TruncSF64 => {
+                context.sink.emit(isa::InstructionInternal::I64TruncSF64);
+            }
+            I64TruncUF64 => {
+                context.sink.emit(isa::InstructionInternal::I64TruncUF64);
+            }
+            F32ConvertSI32 => {
+                context.sink.emit(isa::InstructionInternal::F32ConvertSI32);
+            }
+            F32ConvertUI32 => {
+                context.sink.emit(isa::InstructionInternal::F32ConvertUI32);
+            }
+            F32ConvertSI64 => {
+                context.sink.emit(isa::InstructionInternal::F32ConvertSI64);
+            }
+            F32ConvertUI64 => {
+                context.sink.emit(isa::InstructionInternal::F32ConvertUI64);
+            }
+            F32DemoteF64 => {
+                context.sink.emit(isa::InstructionInternal::F32DemoteF64);
+            }
+            F64ConvertSI32 => {
+                context.sink.emit(isa::InstructionInternal::F64ConvertSI32);
+            }
+            F64ConvertUI32 => {
+                context.sink.emit(isa::InstructionInternal::F64ConvertUI32);
+            }
+            F64ConvertSI64 => {
+                context.sink.emit(isa::InstructionInternal::F64ConvertSI64);
+            }
+            F64ConvertUI64 => {
+                context.sink.emit(isa::InstructionInternal::F64ConvertUI64);
+            }
+            F64PromoteF32 => {
+                context.sink.emit(isa::InstructionInternal::F64PromoteF32);
+            }
+
+            I32ReinterpretF32 => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I32ReinterpretF32);
+            }
+            I64ReinterpretF64 => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::I64ReinterpretF64);
+            }
+            F32ReinterpretI32 => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::F32ReinterpretI32);
+            }
+            F64ReinterpretI64 => {
+                context
+                    .sink
+                    .emit(isa::InstructionInternal::F64ReinterpretI64);
+            }
         }
+
+        Ok(Outcome::NextInstruction)
+    }
+
+    pub fn into_code(self) -> Result<Vec<isa::Instructions>, Error> {
+        Ok(self.code)
+    }
+}
+
+fn make_top_frame_polymorphic(
+    value_stack: &mut StackWithLimit<StackValueType>,
+    frame_stack: &mut StackWithLimit<BlockFrame>,
+) {
+    let frame = frame_stack
+        .top_mut()
+        .expect("make_top_frame_polymorphic is called with empty frame stack");
+    value_stack.resize(frame.value_stack_len, StackValueType::Any);
+    frame.polymorphic_stack = true;
+}
+
+fn push_value(
+    value_stack: &mut StackWithLimit<StackValueType>,
+    value_type: StackValueType,
+) -> Result<(), Error> {
+    Ok(value_stack.push(value_type.into())?)
+}
+
+// TODO: Rename value_type -> expected_value_ty
+fn pop_value(
+    value_stack: &mut StackWithLimit<StackValueType>,
+    frame_stack: &StackWithLimit<BlockFrame>,
+    value_type: StackValueType,
+) -> Result<StackValueType, Error> {
+    let (is_stack_polymorphic, label_value_stack_len) = {
+        let frame = top_label(frame_stack);
+        (frame.polymorphic_stack, frame.value_stack_len)
+    };
+    let stack_is_empty = value_stack.len() == label_value_stack_len;
+    let actual_value = if stack_is_empty && is_stack_polymorphic {
+        StackValueType::Any
+    } else {
+        let value_stack_min = frame_stack
+            .top()
+            .expect("at least 1 topmost block")
+            .value_stack_len;
+        if value_stack.len() <= value_stack_min {
+            return Err(Error("Trying to access parent frame stack values.".into()));
+        }
+        value_stack.pop()?
+    };
+    match actual_value {
+        StackValueType::Specific(stack_value_type) if stack_value_type == value_type => {
+            Ok(actual_value)
+        }
+        StackValueType::Any => Ok(actual_value),
+        stack_value_type @ _ => Err(Error(format!(
+            "Expected value of type {:?} on top of stack. Got {:?}",
+            value_type, stack_value_type
+        ))),
+    }
+}
+
+fn tee_value(
+    value_stack: &mut StackWithLimit<StackValueType>,
+    frame_stack: &StackWithLimit<BlockFrame>,
+    value_type: StackValueType,
+) -> Result<(), Error> {
+    let _ = pop_value(value_stack, frame_stack, value_type)?;
+    push_value(value_stack, value_type)?;
+    Ok(())
+}
+
+fn push_label(
+    frame_type: BlockFrameType,
+    block_type: BlockType,
+    position: usize,
+    value_stack: &StackWithLimit<StackValueType>,
+    frame_stack: &mut StackWithLimit<BlockFrame>,
+) -> Result<(), Error> {
+    Ok(frame_stack.push(BlockFrame {
+        frame_type: frame_type,
+        block_type: block_type,
+        begin_position: position,
+        value_stack_len: value_stack.len(),
+        polymorphic_stack: false,
+    })?)
+}
+
+// TODO: Refactor
+fn pop_label(
+    value_stack: &mut StackWithLimit<StackValueType>,
+    frame_stack: &mut StackWithLimit<BlockFrame>,
+) -> Result<(), Error> {
+    // Don't pop frame yet. This is essential since we still might pop values from the value stack
+    // and this in turn requires current frame to check whether or not we've reached
+    // unreachable.
+    let block_type = frame_stack.top()?.block_type;
+    match block_type {
+        BlockType::NoResult => (),
+        BlockType::Value(required_value_type) => {
+            let _ = pop_value(
+                value_stack,
+                frame_stack,
+                StackValueType::Specific(required_value_type),
+            )?;
+        }
+    }
+
+    let frame = frame_stack.pop()?;
+    if value_stack.len() != frame.value_stack_len {
+        return Err(Error(format!(
+            "Unexpected stack height {}, expected {}",
+            value_stack.len(),
+            frame.value_stack_len
+        )));
     }
 
     Ok(())
 }
 
-pub fn validate_module(module: Module) -> Result<ValidatedModule, Error> {
-    let mut context_builder = ModuleContextBuilder::new();
-    let mut imported_globals = Vec::new();
-    let mut code_map = Vec::new();
+fn top_label(frame_stack: &StackWithLimit<BlockFrame>) -> &BlockFrame {
+    frame_stack
+        .top()
+        .expect("this function can't be called with empty frame stack")
+}
 
-    // Copy types from module as is.
-    context_builder.set_types(
-        module
-            .type_section()
-            .map(|ts| {
-                ts.types()
-                    .into_iter()
-                    .map(|&Type::Function(ref ty)| ty)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default(),
+fn require_label(
+    depth: u32,
+    frame_stack: &StackWithLimit<BlockFrame>,
+) -> Result<&BlockFrame, Error> {
+    Ok(frame_stack.get(depth as usize)?)
+}
+
+fn require_target(
+    depth: u32,
+    value_stack: &StackWithLimit<StackValueType>,
+    frame_stack: &StackWithLimit<BlockFrame>,
+) -> Target {
+    let is_stack_polymorphic = top_label(frame_stack).polymorphic_stack;
+    let frame =
+        require_label(depth, frame_stack).expect("require_target called with a bogus depth");
+
+    // Find out how many values we need to keep (copy to the new stack location after the drop).
+    let keep: isa::Keep = match (frame.frame_type, frame.block_type) {
+        // A loop doesn't take a value upon a branch. It can return value
+        // only via reaching it's closing `End` operator.
+        (BlockFrameType::Loop { .. }, _) => isa::Keep::None,
+
+        (_, BlockType::Value(_)) => isa::Keep::Single,
+        (_, BlockType::NoResult) => isa::Keep::None,
+    };
+
+    // Find out how many values we need to discard.
+    let drop = if is_stack_polymorphic {
+        // Polymorphic stack is a weird state. Fortunately, it always about the code that
+        // will not be executed, so we don't bother and return 0 here.
+        0
+    } else {
+        let value_stack_height = value_stack.len();
+        assert!(
+            value_stack_height >= frame.value_stack_len,
+            "Stack underflow detected: value stack height ({}) is lower than minimum stack len ({})",
+            value_stack_height,
+            frame.value_stack_len,
+        );
+        assert!(
+            (value_stack_height as u32 - frame.value_stack_len as u32) >= keep as u32,
+            "Stack underflow detected: asked to keep {:?} values, but there are only {}",
+            keep,
+            value_stack_height as u32 - frame.value_stack_len as u32,
+        );
+        (value_stack_height as u32 - frame.value_stack_len as u32) - keep as u32
+    };
+
+    Target {
+        label: frame.frame_type.br_destination(),
+        drop_keep: isa::DropKeep { drop, keep },
+    }
+}
+
+fn drop_keep_return(
+    locals: &Locals,
+    value_stack: &StackWithLimit<StackValueType>,
+    frame_stack: &StackWithLimit<BlockFrame>,
+) -> isa::DropKeep {
+    assert!(
+        !frame_stack.is_empty(),
+        "drop_keep_return can't be called with the frame stack empty"
     );
 
-    // Fill elements with imported values.
-    for import_entry in module
-        .import_section()
-        .map(|i| i.entries())
-        .unwrap_or_default()
-    {
-        match *import_entry.external() {
-            External::Function(idx) => context_builder.push_func_type_index(idx),
-            External::Table(ref table) => context_builder.push_table(table.clone()),
-            External::Memory(ref memory) => context_builder.push_memory(memory.clone()),
-            External::Global(ref global) => {
-                context_builder.push_global(global.clone());
-                imported_globals.push(global.clone());
-            }
-        }
-    }
+    let deepest = (frame_stack.len() - 1) as u32;
+    let mut drop_keep = require_target(deepest, value_stack, frame_stack).drop_keep;
 
-    // Concatenate elements with defined in the module.
-    if let Some(function_section) = module.function_section() {
-        for func_entry in function_section.entries() {
-            context_builder.push_func_type_index(func_entry.type_ref())
-        }
-    }
-    if let Some(table_section) = module.table_section() {
-        for table_entry in table_section.entries() {
-            validate_table_type(table_entry)?;
-            context_builder.push_table(table_entry.clone());
-        }
-    }
-    if let Some(mem_section) = module.memory_section() {
-        for mem_entry in mem_section.entries() {
-            validate_memory_type(mem_entry)?;
-            context_builder.push_memory(mem_entry.clone());
-        }
-    }
-    if let Some(global_section) = module.global_section() {
-        for global_entry in global_section.entries() {
-            validate_global_entry(global_entry, &imported_globals)?;
-            context_builder.push_global(global_entry.global_type().clone());
-        }
-    }
+    // Drop all local variables and parameters upon exit.
+    drop_keep.drop += locals.count();
 
-    let context = context_builder.build();
-
-    let function_section_len = module
-        .function_section()
-        .map(|s| s.entries().len())
-        .unwrap_or(0);
-    let code_section_len = module.code_section().map(|s| s.bodies().len()).unwrap_or(0);
-    if function_section_len != code_section_len {
-        return Err(Error(format!(
-            "length of function section is {}, while len of code section is {}",
-            function_section_len, code_section_len
-        )));
-    }
-
-    // validate every function body in user modules
-    if function_section_len != 0 {
-        // tests use invalid code
-        let function_section = module
-            .function_section()
-            .expect("function_section_len != 0; qed");
-        let code_section = module
-            .code_section()
-            .expect("function_section_len != 0; function_section_len == code_section_len; qed");
-        // check every function body
-        for (index, function) in function_section.entries().iter().enumerate() {
-            let function_body = code_section
-                .bodies()
-                .get(index as usize)
-                .ok_or(Error(format!("Missing body for function {}", index)))?;
-            let code =
-                FunctionReader::read_function(&context, function, function_body).map_err(|e| {
-                    let Error(ref msg) = e;
-                    Error(format!(
-                        "Function #{} reading/validation error: {}",
-                        index, msg
-                    ))
-                })?;
-            code_map.push(code);
-        }
-    }
-
-    // validate start section
-    if let Some(start_fn_idx) = module.start_section() {
-        let (params, return_ty) = context.require_function(start_fn_idx)?;
-        if return_ty != BlockType::NoResult || params.len() != 0 {
-            return Err(Error(
-                "start function expected to have type [] -> []".into(),
-            ));
-        }
-    }
-
-    // validate export section
-    if let Some(export_section) = module.export_section() {
-        let mut export_names = HashSet::with_capacity(export_section.entries().len());
-        for export in export_section.entries() {
-            // HashSet::insert returns false if item already in set.
-            let duplicate = export_names.insert(export.field()) == false;
-            if duplicate {
-                return Err(Error(format!("duplicate export {}", export.field())));
-            }
-            match *export.internal() {
-                Internal::Function(function_index) => {
-                    context.require_function(function_index)?;
-                }
-                Internal::Global(global_index) => {
-                    context.require_global(global_index, Some(false))?;
-                }
-                Internal::Memory(memory_index) => {
-                    context.require_memory(memory_index)?;
-                }
-                Internal::Table(table_index) => {
-                    context.require_table(table_index)?;
-                }
-            }
-        }
-    }
-
-    // validate import section
-    if let Some(import_section) = module.import_section() {
-        for import in import_section.entries() {
-            match *import.external() {
-                External::Function(function_type_index) => {
-                    context.require_function_type(function_type_index)?;
-                }
-                External::Global(ref global_type) => {
-                    if global_type.is_mutable() {
-                        return Err(Error(format!(
-                            "trying to import mutable global {}",
-                            import.field()
-                        )));
-                    }
-                }
-                External::Memory(ref memory_type) => {
-                    validate_memory_type(memory_type)?;
-                }
-                External::Table(ref table_type) => {
-                    validate_table_type(table_type)?;
-                }
-            }
-        }
-    }
-
-    // there must be no greater than 1 table in tables index space
-    if context.tables().len() > 1 {
-        return Err(Error(format!(
-            "too many tables in index space: {}",
-            context.tables().len()
-        )));
-    }
-
-    // there must be no greater than 1 linear memory in memory index space
-    if context.memories().len() > 1 {
-        return Err(Error(format!(
-            "too many memory regions in index space: {}",
-            context.memories().len()
-        )));
-    }
-
-    // use data section to initialize linear memory regions
-    if let Some(data_section) = module.data_section() {
-        for data_segment in data_section.entries() {
-            context.require_memory(data_segment.index())?;
-            let init_ty = expr_const_type(data_segment.offset(), context.globals())?;
-            if init_ty != ValueType::I32 {
-                return Err(Error("segment offset should return I32".into()));
-            }
-        }
-    }
-
-    // use element section to fill tables
-    if let Some(element_section) = module.elements_section() {
-        for element_segment in element_section.entries() {
-            context.require_table(element_segment.index())?;
-
-            let init_ty = expr_const_type(element_segment.offset(), context.globals())?;
-            if init_ty != ValueType::I32 {
-                return Err(Error("segment offset should return I32".into()));
-            }
-
-            for function_index in element_segment.members() {
-                context.require_function(*function_index)?;
-            }
-        }
-    }
-
-    Ok(ValidatedModule { module, code_map })
+    drop_keep
 }
 
-fn validate_limits(limits: &ResizableLimits) -> Result<(), Error> {
-    if let Some(maximum) = limits.maximum() {
-        if limits.initial() > maximum {
-            return Err(Error(format!(
-                "maximum limit {} is less than minimum {}",
-                maximum,
-                limits.initial()
-            )));
+fn require_local(locals: &Locals, idx: u32) -> Result<ValueType, Error> {
+    Ok(locals.type_of_local(idx)?)
+}
+
+/// See stack layout definition in mod isa.
+fn relative_local_depth(
+    idx: u32,
+    locals: &Locals,
+    value_stack: &StackWithLimit<StackValueType>,
+) -> Result<u32, Error> {
+    let value_stack_height = value_stack.len() as u32;
+    let locals_and_params_count = locals.count();
+
+    let depth = value_stack_height
+        .checked_add(locals_and_params_count)
+        .and_then(|x| x.checked_sub(idx))
+        .ok_or_else(|| Error(String::from("Locals range not in 32-bit range")))?;
+    Ok(depth)
+}
+
+/// The target of a branch instruction.
+///
+/// It references a `LabelId` instead of exact instruction address. This is handy
+/// for emitting code right away with labels resolved later.
+#[derive(Clone)]
+struct Target {
+    label: LabelId,
+    drop_keep: isa::DropKeep,
+}
+
+/// Identifier of a label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LabelId(usize);
+
+#[derive(Debug, PartialEq, Eq)]
+enum Label {
+    Resolved(u32),
+    NotResolved,
+}
+
+struct Sink {
+    ins: isa::Instructions,
+    labels: Vec<(Label, Vec<isa::Reloc>)>,
+}
+
+impl Sink {
+    fn with_instruction_capacity(capacity: usize) -> Sink {
+        Sink {
+            ins: isa::Instructions::with_capacity(capacity),
+            labels: Vec::new(),
         }
     }
-    Ok(())
-}
 
-fn validate_memory_type(memory_type: &MemoryType) -> Result<(), Error> {
-    let initial: Pages = Pages(memory_type.limits().initial() as usize);
-    let maximum: Option<Pages> = memory_type.limits().maximum().map(|m| Pages(m as usize));
-    ::memory::validate_memory(initial, maximum).map_err(Error)
-}
-
-fn validate_table_type(table_type: &TableType) -> Result<(), Error> {
-    validate_limits(table_type.limits())
-}
-
-fn validate_global_entry(global_entry: &GlobalEntry, globals: &[GlobalType]) -> Result<(), Error> {
-    let init = global_entry.init_expr();
-    let init_expr_ty = expr_const_type(init, globals)?;
-    if init_expr_ty != global_entry.global_type().content_type() {
-        return Err(Error(format!(
-            "Trying to initialize variable of type {:?} with value of type {:?}",
-            global_entry.global_type().content_type(),
-            init_expr_ty
-        )));
+    fn cur_pc(&self) -> u32 {
+        self.ins.current_pc()
     }
-    Ok(())
-}
 
-/// Returns type of this constant expression.
-fn expr_const_type(init_expr: &InitExpr, globals: &[GlobalType]) -> Result<ValueType, Error> {
-    let code = init_expr.code();
-    if code.len() != 2 {
-        return Err(Error(
-            "Init expression should always be with length 2".into(),
-        ));
-    }
-    let expr_ty: ValueType = match code[0] {
-        Instruction::I32Const(_) => ValueType::I32,
-        Instruction::I64Const(_) => ValueType::I64,
-        Instruction::F32Const(_) => ValueType::F32,
-        Instruction::F64Const(_) => ValueType::F64,
-        Instruction::GetGlobal(idx) => match globals.get(idx as usize) {
-            Some(target_global) => {
-                if target_global.is_mutable() {
-                    return Err(Error(format!("Global {} is mutable", idx)));
-                }
-                target_global.content_type()
+    fn pc_or_placeholder<F: FnOnce() -> isa::Reloc>(
+        &mut self,
+        label: LabelId,
+        reloc_creator: F,
+    ) -> u32 {
+        match self.labels[label.0] {
+            (Label::Resolved(dst_pc), _) => dst_pc,
+            (Label::NotResolved, ref mut unresolved) => {
+                unresolved.push(reloc_creator());
+                u32::max_value()
             }
-            None => {
-                return Err(Error(format!(
-                    "Global {} doesn't exists or not yet defined",
-                    idx
-                )));
-            }
-        },
-        _ => return Err(Error("Non constant opcode in init expr".into())),
-    };
-    if code[1] != Instruction::End {
-        return Err(Error("Expression doesn't ends with `end` opcode".into()));
+        }
     }
-    Ok(expr_ty)
+
+    fn emit(&mut self, instruction: isa::InstructionInternal) {
+        self.ins.push(instruction);
+    }
+
+    fn emit_br(&mut self, target: Target) {
+        let Target { label, drop_keep } = target;
+        let pc = self.cur_pc();
+        let dst_pc = self.pc_or_placeholder(label, || isa::Reloc::Br { pc });
+        self.ins.push(isa::InstructionInternal::Br(isa::Target {
+            dst_pc,
+            drop_keep: drop_keep.into(),
+        }));
+    }
+
+    fn emit_br_eqz(&mut self, target: Target) {
+        let Target { label, drop_keep } = target;
+        let pc = self.cur_pc();
+        let dst_pc = self.pc_or_placeholder(label, || isa::Reloc::Br { pc });
+        self.ins
+            .push(isa::InstructionInternal::BrIfEqz(isa::Target {
+                dst_pc,
+                drop_keep: drop_keep.into(),
+            }));
+    }
+
+    fn emit_br_nez(&mut self, target: Target) {
+        let Target { label, drop_keep } = target;
+        let pc = self.cur_pc();
+        let dst_pc = self.pc_or_placeholder(label, || isa::Reloc::Br { pc });
+        self.ins
+            .push(isa::InstructionInternal::BrIfNez(isa::Target {
+                dst_pc,
+                drop_keep: drop_keep.into(),
+            }));
+    }
+
+    fn emit_br_table(&mut self, targets: &[Target], default: Target) {
+        use core::iter;
+
+        let pc = self.cur_pc();
+
+        self.ins.push(isa::InstructionInternal::BrTable {
+            count: targets.len() as u32 + 1,
+        });
+
+        for (idx, &Target { label, drop_keep }) in
+            targets.iter().chain(iter::once(&default)).enumerate()
+        {
+            let dst_pc = self.pc_or_placeholder(label, || isa::Reloc::BrTable { pc, idx });
+            self.ins
+                .push(isa::InstructionInternal::BrTableTarget(isa::Target {
+                    dst_pc,
+                    drop_keep: drop_keep.into(),
+                }));
+        }
+    }
+
+    /// Create a new unresolved label.
+    fn new_label(&mut self) -> LabelId {
+        let label_idx = self.labels.len();
+        self.labels.push((Label::NotResolved, Vec::new()));
+        LabelId(label_idx)
+    }
+
+    /// Resolve the label at the current position.
+    ///
+    /// Panics if the label is already resolved.
+    fn resolve_label(&mut self, label: LabelId) {
+        use core::mem;
+
+        if let (Label::Resolved(_), _) = self.labels[label.0] {
+            panic!("Trying to resolve already resolved label");
+        }
+        let dst_pc = self.cur_pc();
+
+        // Patch all relocations that was previously recorded for this
+        // particular label.
+        let unresolved_rels = mem::replace(&mut self.labels[label.0].1, Vec::new());
+        for reloc in unresolved_rels {
+            self.ins.patch_relocation(reloc, dst_pc);
+        }
+
+        // Mark this label as resolved.
+        self.labels[label.0] = (Label::Resolved(dst_pc), Vec::new());
+    }
+
+    /// Consume this Sink and returns isa::Instructions.
+    fn into_inner(&self) -> isa::Instructions {
+        // At this moment all labels should be resolved.
+        assert!(
+            {
+                self.labels
+                    .iter()
+                    .all(|(state, unresolved)| match (state, unresolved) {
+                        (Label::Resolved(_), unresolved) if unresolved.is_empty() => true,
+                        _ => false,
+                    })
+            },
+            "there are unresolved labels left: {:?}",
+            self.labels
+        );
+        self.ins.clone()
+    }
 }

@@ -1,4 +1,4 @@
-pub mod stack;
+//pub mod stack;
 
 /// Index of default linear memory.
 pub const DEFAULT_MEMORY_INDEX: u32 = 0;

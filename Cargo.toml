@@ -24,6 +24,7 @@ byteorder = { version = "1.0", default-features = false }
 hashmap_core = { version = "0.1.9", optional = true }
 memory_units = "0.3.0"
 libm = { version = "0.1.2", optional = true }
+wasm-validate = { git = "https://github.com/montekki/wasm-validate" }
 
 [dev-dependencies]
 assert_matches = "1.1"

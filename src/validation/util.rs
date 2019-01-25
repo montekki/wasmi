@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use alloc::prelude::*;
+use new_validation::Error;
 use parity_wasm::elements::{Local, ValueType};
-use validation::Error;
 
 /// Locals are the concatenation of a slice of function parameters
 /// with function declared local variables.
@@ -10,14 +10,14 @@ use validation::Error;
 /// of a value_type and a count.
 #[derive(Debug)]
 pub struct Locals<'a> {
-    params: &'a [ValueType],
+    params: Vec<ValueType>,
     local_groups: &'a [Local],
     count: u32,
 }
 
 impl<'a> Locals<'a> {
     /// Create a new wrapper around declared variables and parameters.
-    pub fn new(params: &'a [ValueType], local_groups: &'a [Local]) -> Result<Locals<'a>, Error> {
+    pub fn new(params: Vec<ValueType>, local_groups: &'a [Local]) -> Result<Locals<'a>, Error> {
         let mut acc = params.len() as u32;
         for locals_group in local_groups {
             acc = acc
@@ -84,7 +84,7 @@ mod tests {
     fn locals_it_works() {
         let params = vec![ValueType::I32, ValueType::I64];
         let local_groups = vec![Local::new(2, ValueType::F32), Local::new(2, ValueType::F64)];
-        let locals = Locals::new(&params, &local_groups).unwrap();
+        let locals = Locals::new(params, &local_groups).unwrap();
 
         assert_matches!(locals.type_of_local(0), Ok(ValueType::I32));
         assert_matches!(locals.type_of_local(1), Ok(ValueType::I64));
@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn locals_no_declared_locals() {
         let params = vec![ValueType::I32];
-        let locals = Locals::new(&params, &[]).unwrap();
+        let locals = Locals::new(params, &[]).unwrap();
 
         assert_matches!(locals.type_of_local(0), Ok(ValueType::I32));
         assert_matches!(locals.type_of_local(1), Err(_));
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn locals_no_params() {
         let local_groups = vec![Local::new(2, ValueType::I32), Local::new(3, ValueType::I64)];
-        let locals = Locals::new(&[], &local_groups).unwrap();
+        let locals = Locals::new(vec![], &local_groups).unwrap();
 
         assert_matches!(locals.type_of_local(0), Ok(ValueType::I32));
         assert_matches!(locals.type_of_local(1), Ok(ValueType::I32));
@@ -123,6 +123,6 @@ mod tests {
             Local::new(u32::max_value(), ValueType::I32),
             Local::new(1, ValueType::I64),
         ];
-        assert_matches!(Locals::new(&[], &local_groups), Err(_));
+        assert_matches!(Locals::new(vec![], &local_groups), Err(_));
     }
 }
